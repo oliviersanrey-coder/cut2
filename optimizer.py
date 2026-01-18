@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 
-OPTIMIZER_VERSION = "v1-clean-2026-01-18"
+OPTIMIZER_VERSION = "v2-subrip-allowed-2026-01-18"
 
 
 @dataclass(frozen=True)
@@ -50,6 +50,8 @@ class Placement:
     L: int
     W: int
     rotated: bool
+    # new: whether this placement requires a sub-rip inside the strip/band
+    subrip: bool
 
     @property
     def area_mm2(self) -> int:
@@ -115,7 +117,8 @@ def pack_rip_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelLayout
     UL, UW, k = panel.usable_L, panel.usable_W, panel.kerf
     pieces_sorted = sorted(pieces, key=lambda p: max(p.length, p.width), reverse=True)
 
-    strips: List[Dict] = []  # {y,h,x_cursor}
+    # strips: {y, h, x_cursor}
+    strips: List[Dict] = []
     placements: List[Placement] = []
 
     for p in pieces_sorted:
@@ -124,20 +127,24 @@ def pack_rip_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelLayout
             continue
 
         best_choice = None
-        # score: (new_strip?, strip_height, wasted_x, y_pos) lower is better
+        # score: (new_strip?, needs_subrip?, strip_height, wasted_x, y_pos)
+        # We strongly prefer: existing strip, no subrip, small strip height, small waste.
         for L, W, rot in cands:
             for s in strips:
-                if s["h"] != W:
-                    continue
+                h = s["h"]
+                if W > h:
+                    continue  # cannot fit this width in this strip
                 x = s["x"]
                 if x + L <= UL:
-                    score = (0, W, UL - (x + L), s["y"])
+                    needs_subrip = 1 if W < h else 0
+                    score = (0, needs_subrip, h, UL - (x + L), s["y"])
                     if best_choice is None or score < best_choice[0]:
-                        best_choice = (score, ("existing", s, L, W, rot))
+                        best_choice = (score, ("existing", s, L, W, rot, needs_subrip))
 
+            # new strip with height exactly W (no subrip at creation)
             new_y = 0 if not strips else strips[-1]["y"] + strips[-1]["h"] + k
             if new_y + W <= UW:
-                score = (1, W, UL - L, new_y)
+                score = (1, 0, W, UL - L, new_y)
                 if best_choice is None or score < best_choice[0]:
                     best_choice = (score, ("new", new_y, L, W, rot))
 
@@ -147,14 +154,14 @@ def pack_rip_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelLayout
         choice = best_choice[1]
         if choice[0] == "existing":
             s = choice[1]
-            L, W, rot = choice[2], choice[3], choice[4]
+            L, W, rot, needs_subrip = choice[2], choice[3], choice[4], choice[5]
             x = s["x"]
-            placements.append(Placement(p.name, x, s["y"], L, W, rot))
+            placements.append(Placement(p.name, x, s["y"], L, W, rot, subrip=bool(needs_subrip)))
             s["x"] = x + L + k
         else:
             new_y, L, W, rot = choice[1], choice[2], choice[3], choice[4]
             strips.append({"y": new_y, "h": W, "x": L + k})
-            placements.append(Placement(p.name, 0, new_y, L, W, rot))
+            placements.append(Placement(p.name, 0, new_y, L, W, rot, subrip=False))
 
     groups = [(s["y"], s["h"]) for s in strips]
     return PanelLayout(strategy="RIP_FIRST", placements=placements, groups=groups)
@@ -164,7 +171,8 @@ def pack_crosscut_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelL
     UL, UW, k = panel.usable_L, panel.usable_W, panel.kerf
     pieces_sorted = sorted(pieces, key=lambda p: max(p.length, p.width), reverse=True)
 
-    bands: List[Dict] = []  # {x,w,y_cursor}
+    # bands: {x, w, y_cursor} where w is band length along X
+    bands: List[Dict] = []
     placements: List[Placement] = []
 
     for p in pieces_sorted:
@@ -173,20 +181,22 @@ def pack_crosscut_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelL
             continue
 
         best_choice = None
-        # score: (new_band?, band_length, wasted_y, x_pos) lower is better
+        # score: (new_band?, needs_subrip?, band_length, wasted_y, x_pos)
         for L, W, rot in cands:
             for b in bands:
-                if b["w"] != L:
-                    continue
+                band_L = b["w"]
+                if L > band_L:
+                    continue  # cannot fit this length in this band
                 y = b["y"]
                 if y + W <= UW:
-                    score = (0, L, UW - (y + W), b["x"])
+                    needs_subrip = 1 if L < band_L else 0
+                    score = (0, needs_subrip, band_L, UW - (y + W), b["x"])
                     if best_choice is None or score < best_choice[0]:
-                        best_choice = (score, ("existing", b, L, W, rot))
+                        best_choice = (score, ("existing", b, L, W, rot, needs_subrip))
 
             new_x = 0 if not bands else bands[-1]["x"] + bands[-1]["w"] + k
             if new_x + L <= UL:
-                score = (1, L, UW - W, new_x)
+                score = (1, 0, L, UW - W, new_x)
                 if best_choice is None or score < best_choice[0]:
                     best_choice = (score, ("new", new_x, L, W, rot))
 
@@ -196,23 +206,26 @@ def pack_crosscut_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelL
         choice = best_choice[1]
         if choice[0] == "existing":
             b = choice[1]
-            L, W, rot = choice[2], choice[3], choice[4]
+            L, W, rot, needs_subrip = choice[2], choice[3], choice[4], choice[5]
             y = b["y"]
-            placements.append(Placement(p.name, b["x"], y, L, W, rot))
+            placements.append(Placement(p.name, b["x"], y, L, W, rot, subrip=bool(needs_subrip)))
             b["y"] = y + W + k
         else:
             new_x, L, W, rot = choice[1], choice[2], choice[3], choice[4]
             bands.append({"x": new_x, "w": L, "y": W + k})
-            placements.append(Placement(p.name, new_x, 0, L, W, rot))
+            placements.append(Placement(p.name, new_x, 0, L, W, rot, subrip=False))
 
     groups = [(b["x"], b["w"]) for b in bands]
     return PanelLayout(strategy="CROSSCUT_FIRST", placements=placements, groups=groups)
 
 
 def estimate_cuts(layouts: List[PanelLayout]) -> int:
+    # base heuristic: (main group cuts) + (piece crosscuts) + (extra subrips)
     total = 0
     for lay in layouts:
-        total += max(0, len(lay.groups) - 1) + len(lay.placements)
+        total += max(0, len(lay.groups) - 1)
+        total += len(lay.placements)
+        total += sum(1 for p in lay.placements if p.subrip)
     return total
 
 
