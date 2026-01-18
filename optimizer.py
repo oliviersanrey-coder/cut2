@@ -1,7 +1,8 @@
+# optimizer.py
 from dataclasses import dataclass
 from typing import List, Tuple, Dict
 
-OPTIMIZER_VERSION = "v2-subrip-allowed-2026-01-18"
+OPTIMIZER_VERSION = "v3-subrip-multiorder-2026-01-18"
 
 
 @dataclass(frozen=True)
@@ -50,8 +51,7 @@ class Placement:
     L: int
     W: int
     rotated: bool
-    # new: whether this placement requires a sub-rip inside the strip/band
-    subrip: bool
+    subrip: bool  # True if placed inside a wider strip/band (requires a sub-rip)
 
     @property
     def area_mm2(self) -> int:
@@ -114,8 +114,9 @@ def oriented_candidates(piece: PieceInstance):
 
 
 def pack_rip_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelLayout:
+    # IMPORTANT: do not sort here; respect caller-provided order (v3 multi-order solve)
     UL, UW, k = panel.usable_L, panel.usable_W, panel.kerf
-    pieces_sorted = sorted(pieces, key=lambda p: max(p.length, p.width), reverse=True)
+    pieces_sorted = pieces[:]
 
     # strips: {y, h, x_cursor}
     strips: List[Dict] = []
@@ -128,12 +129,11 @@ def pack_rip_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelLayout
 
         best_choice = None
         # score: (new_strip?, needs_subrip?, strip_height, wasted_x, y_pos)
-        # We strongly prefer: existing strip, no subrip, small strip height, small waste.
         for L, W, rot in cands:
             for s in strips:
                 h = s["h"]
                 if W > h:
-                    continue  # cannot fit this width in this strip
+                    continue
                 x = s["x"]
                 if x + L <= UL:
                     needs_subrip = 1 if W < h else 0
@@ -141,7 +141,6 @@ def pack_rip_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelLayout
                     if best_choice is None or score < best_choice[0]:
                         best_choice = (score, ("existing", s, L, W, rot, needs_subrip))
 
-            # new strip with height exactly W (no subrip at creation)
             new_y = 0 if not strips else strips[-1]["y"] + strips[-1]["h"] + k
             if new_y + W <= UW:
                 score = (1, 0, W, UL - L, new_y)
@@ -168,8 +167,9 @@ def pack_rip_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelLayout
 
 
 def pack_crosscut_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelLayout:
+    # IMPORTANT: do not sort here; respect caller-provided order (v3 multi-order solve)
     UL, UW, k = panel.usable_L, panel.usable_W, panel.kerf
-    pieces_sorted = sorted(pieces, key=lambda p: max(p.length, p.width), reverse=True)
+    pieces_sorted = pieces[:]
 
     # bands: {x, w, y_cursor} where w is band length along X
     bands: List[Dict] = []
@@ -186,7 +186,7 @@ def pack_crosscut_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelL
             for b in bands:
                 band_L = b["w"]
                 if L > band_L:
-                    continue  # cannot fit this length in this band
+                    continue
                 y = b["y"]
                 if y + W <= UW:
                     needs_subrip = 1 if L < band_L else 0
@@ -220,34 +220,28 @@ def pack_crosscut_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelL
 
 
 def estimate_cuts(layouts: List[PanelLayout]) -> int:
+    # heuristic:
+    # - main separating cuts between groups: (groups - 1)
+    # - series cuts inside each group: (pieces_in_group - 1)
+    # - each subrip counts as +1 operation
     total = 0
     for lay in layouts:
-        # main rips/crosscuts to create the big strips/bands
-        # if you have N groups, you need N-1 separating cuts
         total += max(0, len(lay.groups) - 1)
 
-        # then per group, you cut pieces in series:
-        # N pieces in a row -> N-1 cuts (last piece is the remaining end)
         if lay.strategy == "RIP_FIRST":
-            # group by strip (same y)
             by_strip = {}
             for p in lay.placements:
                 by_strip.setdefault(p.y, []).append(p)
-            for _, ps in by_strip.items():
-                total += max(0, len(ps) - 1)
+            total += sum(max(0, len(ps) - 1) for ps in by_strip.values())
         else:
-            # group by band (same x)
             by_band = {}
             for p in lay.placements:
                 by_band.setdefault(p.x, []).append(p)
-            for _, ps in by_band.items():
-                total += max(0, len(ps) - 1)
+            total += sum(max(0, len(ps) - 1) for ps in by_band.values())
 
-        # extra subrip operations (when piece width < strip height or piece length < band length)
-        total += sum(1 for p in lay.placements if getattr(p, "subrip", False))
+        total += sum(1 for p in lay.placements if p.subrip)
 
     return total
-
 
 
 def compute_solution_metrics(panel: PanelSpec, layouts: List[PanelLayout], strategy: str) -> Solution:
@@ -266,15 +260,16 @@ def compute_solution_metrics(panel: PanelSpec, layouts: List[PanelLayout], strat
 
 
 def solve(panel: PanelSpec, piece_specs: List[PieceType]) -> List[Solution]:
+    import random
+
     pieces = expand_pieces(piece_specs)
 
     bad = [p.name for p in pieces if not can_fit(panel, p)]
     if bad:
         raise ValueError("Pieces do not fit in usable panel area: " + ", ".join(bad))
 
-    solutions: List[Solution] = []
-    for strategy in ("RIP_FIRST", "CROSSCUT_FIRST"):
-        remaining = pieces[:]
+    def run_with_order(order: List[PieceInstance], strategy: str) -> Solution:
+        remaining = order[:]
         layouts: List[PanelLayout] = []
 
         while remaining:
@@ -285,14 +280,38 @@ def solve(panel: PanelSpec, piece_specs: List[PieceType]) -> List[Solution]:
             layouts.append(lay)
             remaining = [p for p in remaining if p.name not in placed]
 
-        solutions.append(compute_solution_metrics(panel, layouts, strategy))
+        return compute_solution_metrics(panel, layouts, strategy)
 
-    solutions.sort(key=lambda s: (s.panels_used, s.est_cuts))
-    best = [solutions[0]]
-    if len(solutions) > 1:
-        s0, s1 = solutions[0], solutions[1]
-        if (s1.panels_used, s1.est_cuts) != (s0.panels_used, s0.est_cuts):
-            best.append(s1)
-        elif s1.strategy != s0.strategy:
-            best.append(s1)
+    def key_area(p: PieceInstance) -> int:
+        return p.length * p.width
+
+    def key_maxdim(p: PieceInstance) -> int:
+        return max(p.length, p.width)
+
+    base = pieces[:]
+    orders: List[List[PieceInstance]] = [
+        sorted(base, key=key_maxdim, reverse=True),
+        sorted(base, key=key_area, reverse=True),
+        sorted(base, key=lambda p: (p.width, p.length), reverse=True),
+        sorted(base, key=lambda p: (p.length, p.width), reverse=True),
+    ]
+
+    rnd = random.Random(42)
+    for _ in range(6):
+        tmp = base[:]
+        rnd.shuffle(tmp)
+        orders.append(tmp)
+
+    candidates: List[Solution] = []
+    for order in orders:
+        for strategy in ("RIP_FIRST", "CROSSCUT_FIRST"):
+            candidates.append(run_with_order(order, strategy))
+
+    candidates.sort(key=lambda s: (s.panels_used, s.est_cuts))
+
+    best = [candidates[0]]
+    for c in candidates[1:]:
+        if (c.panels_used, c.est_cuts, c.strategy) != (best[0].panels_used, best[0].est_cuts, best[0].strategy):
+            best.append(c)
+            break
     return best
