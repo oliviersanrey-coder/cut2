@@ -220,13 +220,34 @@ def pack_crosscut_first(panel: PanelSpec, pieces: List[PieceInstance]) -> PanelL
 
 
 def estimate_cuts(layouts: List[PanelLayout]) -> int:
-    # base heuristic: (main group cuts) + (piece crosscuts) + (extra subrips)
     total = 0
     for lay in layouts:
+        # main rips/crosscuts to create the big strips/bands
+        # if you have N groups, you need N-1 separating cuts
         total += max(0, len(lay.groups) - 1)
-        total += len(lay.placements)
-        total += sum(1 for p in lay.placements if p.subrip)
+
+        # then per group, you cut pieces in series:
+        # N pieces in a row -> N-1 cuts (last piece is the remaining end)
+        if lay.strategy == "RIP_FIRST":
+            # group by strip (same y)
+            by_strip = {}
+            for p in lay.placements:
+                by_strip.setdefault(p.y, []).append(p)
+            for _, ps in by_strip.items():
+                total += max(0, len(ps) - 1)
+        else:
+            # group by band (same x)
+            by_band = {}
+            for p in lay.placements:
+                by_band.setdefault(p.x, []).append(p)
+            for _, ps in by_band.items():
+                total += max(0, len(ps) - 1)
+
+        # extra subrip operations (when piece width < strip height or piece length < band length)
+        total += sum(1 for p in lay.placements if getattr(p, "subrip", False))
+
     return total
+
 
 
 def compute_solution_metrics(panel: PanelSpec, layouts: List[PanelLayout], strategy: str) -> Solution:
